@@ -27,12 +27,13 @@ import {
   InterpretedResultsSortState,
   SortDirection,
   ALERTS_TABLE_NAME,
+  GRAPH_TABLE_NAME,
   RawResultsSortState,
 } from './pure/interface-types';
 import { Logger } from './logging';
 import { commandRunner } from './helpers';
 import * as messages from './pure/messages';
-import { CompletedQuery, interpretResults } from './query-results';
+import { CompletedQuery, interpretSarifResults, interpretGraphResults } from './query-results';
 import { QueryInfo, tmpDir } from './run-queries';
 import { parseSarifLocation, parseSarifPlainTextMessage } from './pure/sarif-utils';
 import {
@@ -87,12 +88,33 @@ function sortInterpretedResults(
   }
 }
 
-function numPagesOfResultSet(resultSet: RawResultSet): number {
-  return Math.ceil(resultSet.schema.rows / PAGE_SIZE.getValue<number>());
+function interpretedPageSize(interpretation: Interpretation | undefined): number {
+  if (interpretation && interpretation.data.t == 'GraphInterpretationData')
+    return 1;
+  return PAGE_SIZE.getValue<number>();
+}
+
+function numPagesOfResultSet(resultSet: RawResultSet, interpretation?: Interpretation): number {
+  const pageSize = interpretedPageSize(interpretation);
+
+  const n = interpretation && interpretation.data.t == 'GraphInterpretationData'
+    ? interpretation.data.dot.length
+    : resultSet.schema.rows;
+  
+  return Math.ceil(n / pageSize);
 }
 
 function numInterpretedPages(interpretation: Interpretation | undefined): number {
-  return Math.ceil((interpretation?.sarif.runs[0].results?.length || 0) / PAGE_SIZE.getValue<number>());
+  if (!interpretation)
+    return 0;
+  
+  const pageSize = interpretedPageSize(interpretation);
+
+  const n = interpretation.data.t == 'GraphInterpretationData'
+    ? interpretation.data.dot.length
+    : interpretation.data.runs[0].results?.length || 0;
+  
+  return Math.ceil(n / pageSize);
 }
 
 export class InterfaceManager extends DisposableObject {
@@ -271,7 +293,7 @@ export class InterfaceManager extends DisposableObject {
         await this.changeInterpretedSortState(msg.sortState);
         break;
       case 'changePage':
-        if (msg.selectedTable === ALERTS_TABLE_NAME) {
+        if (msg.selectedTable === ALERTS_TABLE_NAME || msg.selectedTable === GRAPH_TABLE_NAME) {
           await this.showPageOfInterpretedResults(msg.pageNumber);
         }
         else {
@@ -397,7 +419,7 @@ export class InterfaceManager extends DisposableObject {
     const parsedResultSets: ParsedResultSets = {
       pageNumber: 0,
       pageSize,
-      numPages: numPagesOfResultSet(resultSet),
+      numPages: numPagesOfResultSet(resultSet, this._interpretation),
       numInterpretedPages: numInterpretedPages(this._interpretation),
       resultSet: { ...resultSet, t: 'RawResultSet' },
       selectedTable: undefined,
@@ -433,7 +455,7 @@ export class InterfaceManager extends DisposableObject {
     if (this._interpretation === undefined) {
       throw new Error('Trying to show interpreted results but interpretation was undefined');
     }
-    if (this._interpretation.sarif.runs[0].results === undefined) {
+    if (this._interpretation.data.t === 'SarifInterpretationData' && this._interpretation.data.runs[0].results === undefined) {
       throw new Error('Trying to show interpreted results but results were undefined');
     }
 
@@ -447,7 +469,7 @@ export class InterfaceManager extends DisposableObject {
       metadata: this._displayedQuery.query.metadata,
       pageNumber,
       resultSetNames,
-      pageSize: PAGE_SIZE.getValue(),
+      pageSize: interpretedPageSize(this._interpretation),
       numPages: numInterpretedPages(this._interpretation),
       queryName: this._displayedQuery.toString(),
       queryPath: this._displayedQuery.query.program.queryPath
@@ -541,26 +563,43 @@ export class InterfaceManager extends DisposableObject {
     sourceLocationPrefix: string,
     sortState: InterpretedResultsSortState | undefined
   ): Promise<Interpretation> {
-    const sarif = await interpretResults(
-      this.cliServer,
-      metadata,
-      resultsPaths,
-      sourceInfo
-    );
-    sarif.runs.forEach(run => {
-      if (run.results !== undefined) {
-        sortInterpretedResults(run.results, sortState);
-      }
-    });
+    let data;
+    let numTotalResults;
+    if (metadata?.kind === 'graph')
+    {
+      data = await interpretGraphResults(
+        this.cliServer,
+        metadata,
+        resultsPaths,
+        sourceInfo
+      );
+      numTotalResults = data.dot.length;
+    }
+    else
+    {
+      const sarif = await interpretSarifResults(
+        this.cliServer,
+        metadata,
+        resultsPaths,
+        sourceInfo
+      );
+      sarif.runs.forEach(run => {
+        if (run.results !== undefined) {
+          sortInterpretedResults(run.results, sortState);
+        }
+      });
 
-    const numTotalResults = (() => {
-      if (sarif.runs.length === 0) return 0;
-      if (sarif.runs[0].results === undefined) return 0;
-      return sarif.runs[0].results.length;
-    })();
+      data = sarif;
+
+      numTotalResults = (() => {
+        if (sarif.runs.length === 0) return 0;
+        if (sarif.runs[0].results === undefined) return 0;
+        return sarif.runs[0].results.length;
+      })();
+    }
 
     const interpretation: Interpretation = {
-      sarif,
+      data,
       sourceLocationPrefix,
       numTruncatedResults: 0,
       numTotalResults,
@@ -573,7 +612,6 @@ export class InterfaceManager extends DisposableObject {
   private getPageOfInterpretedResults(
     pageNumber: number
   ): Interpretation {
-
     function getPageOfRun(run: Sarif.Run): Sarif.Run {
       return {
         ...run, results: run.results?.slice(
@@ -583,16 +621,21 @@ export class InterfaceManager extends DisposableObject {
       };
     }
 
-    if (this._interpretation === undefined) {
+    const interp = this._interpretation;
+    if (interp === undefined) {
       throw new Error('Tried to get interpreted results before interpretation finished');
     }
-    if (this._interpretation.sarif.runs.length !== 1) {
-      this.logger.log(`Warning: SARIF file had ${this._interpretation.sarif.runs.length} runs, expected 1`);
+
+    if (interp.data.t !== 'SarifInterpretationData')
+      return interp;
+
+    if (interp.data.runs.length !== 1) {
+      this.logger.log(`Warning: SARIF file had ${interp.data.runs.length} runs, expected 1`);
     }
-    const interp = this._interpretation;
+    
     return {
       ...interp,
-      sarif: { ...interp.sarif, runs: [getPageOfRun(interp.sarif.runs[0])] },
+      data: { ...interp.data, runs: [getPageOfRun(interp.data.runs[0])] },
     };
   }
 
@@ -674,9 +717,12 @@ export class InterfaceManager extends DisposableObject {
     interpretation: Interpretation,
     databaseItem: DatabaseItem
   ): Promise<void> {
-    const { sarif, sourceLocationPrefix } = interpretation;
+    const { data, sourceLocationPrefix } = interpretation;
 
-    if (!sarif.runs || !sarif.runs[0].results) {
+    if (data.t !== 'SarifInterpretationData')
+      return;
+
+    if (!data.runs || !data.runs[0].results) {
       this.logger.log(
         'Didn\'t find a run in the sarif results. Error processing sarif?'
       );
@@ -685,7 +731,7 @@ export class InterfaceManager extends DisposableObject {
 
     const diagnostics: [Uri, ReadonlyArray<Diagnostic>][] = [];
 
-    for (const result of sarif.runs[0].results) {
+    for (const result of data.runs[0].results) {
       const message = result.message.text;
       if (message === undefined) {
         this.logger.log('Sarif had result without plaintext message');

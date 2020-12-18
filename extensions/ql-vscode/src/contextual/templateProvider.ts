@@ -187,3 +187,62 @@ export class TemplatePrintAstProvider {
     );
   }
 }
+
+export class TemplatePrintCfgProvider {
+  private cache: CachedOperation<[vscode.Uri, messages.TemplateDefinitions] | undefined>;
+
+  constructor(
+    private cli: CodeQLCliServer,
+    private dbm: DatabaseManager
+  ) {
+    this.cache = new CachedOperation<[vscode.Uri, messages.TemplateDefinitions] | undefined>(this.getCfgUri.bind(this));
+  }
+
+  async provideCfgUri(document?: vscode.TextDocument): Promise<[vscode.Uri, messages.TemplateDefinitions] | undefined> {
+    if (!document) {
+      return;
+    }
+    return await this.cache.get(document.uri.toString());
+  }
+
+  private async getCfgUri(uriString: string): Promise<[vscode.Uri, messages.TemplateDefinitions]> {
+    const uri = vscode.Uri.parse(uriString, true);
+    if (uri.scheme !== zipArchiveScheme) {
+      throw new Error('CFG Viewing is only available for databases with zipped source archives.');
+    }
+
+    const zippedArchive = decodeSourceArchiveUri(uri);
+    const sourceArchiveUri = encodeArchiveBasePath(zippedArchive.sourceArchiveZipPath);
+    const db = this.dbm.findDatabaseItemBySourceArchive(sourceArchiveUri);
+
+    if (!db) {
+      throw new Error('Can\'t infer database from the provided source.');
+    }
+
+    const qlpack = await qlpackOfDatabase(this.cli, db);
+    if (!qlpack) {
+      throw new Error('Can\'t infer qlpack from database source archive');
+    }
+    const queries = await resolveQueries(this.cli, qlpack, KeyType.PrintCfgQuery);
+    if (queries.length > 1) {
+      throw new Error('Found multiple Print CFG queries. Can\'t continue');
+    }
+    if (queries.length === 0) {
+      throw new Error('Did not find any Print CFG queries. Can\'t continue');
+    }
+
+    const queryUri = vscode.Uri.file(queries[0]);
+
+    const templates: messages.TemplateDefinitions = {
+      [TEMPLATE_NAME]: {
+        values: {
+          tuples: [[{
+            stringValue: zippedArchive.pathWithinSourceArchive
+          }]]
+        }
+      }
+    };
+
+    return [queryUri, templates];
+  }
+}

@@ -6,9 +6,14 @@ import * as cli from './cli';
 import * as sarif from 'sarif';
 import * as fs from 'fs-extra';
 import * as path from 'path';
-import { RawResultsSortState, SortedResultSetInfo, DatabaseInfo, QueryMetadata, InterpretedResultsSortState, ResultsPaths } from './pure/interface-types';
+import { RawResultsSortState, SortedResultSetInfo, DatabaseInfo, QueryMetadata, InterpretedResultsSortState, ResultsPaths, SarifInterpretationData, GraphInterpretationData } from './pure/interface-types';
 import { QueryHistoryConfig } from './config';
 import { QueryHistoryItemOptions } from './query-history';
+
+/**
+ * The version of the SARIF format that we are using.
+ */
+const SARIF_FORMAT = 'sarifv2.1.0';
 
 export class CompletedQuery implements QueryWithResults {
   readonly time: string;
@@ -158,17 +163,17 @@ export function getQueryName(query: QueryInfo) {
 
 
 /**
- * Call cli command to interpret results.
+ * Call cli command to interpret SARIF results.
  */
-export async function interpretResults(
+export async function interpretSarifResults(
   server: cli.CodeQLCliServer,
   metadata: QueryMetadata | undefined,
   resultsPaths: ResultsPaths,
   sourceInfo?: cli.SourceInfo
-): Promise<sarif.Log> {
+): Promise<SarifInterpretationData> {
   const { resultsPath, interpretedResultsPath } = resultsPaths;
   if (await fs.pathExists(interpretedResultsPath)) {
-    return JSON.parse(await fs.readFile(interpretedResultsPath, 'utf8'));
+    return { ...JSON.parse(await fs.readFile(interpretedResultsPath, 'utf8')), t: 'SarifInterpretationData' };
   }
   if (metadata === undefined) {
     throw new Error('Can\'t interpret results without query metadata');
@@ -182,5 +187,69 @@ export async function interpretResults(
     // SARIF format does, so in the absence of one, we use a dummy id.
     id = 'dummy-id';
   }
-  return await server.interpretBqrs({ kind, id }, resultsPath, interpretedResultsPath, sourceInfo);
+  const additionalArgs = [
+    // TODO: This flag means that we don't group interpreted results
+    // by primary location. We may want to revisit whether we call
+    // interpretation with and without this flag, or do some
+    // grouping client-side.
+    '--no-group-results'
+  ];
+
+  await server.interpretBqrs({ kind, id }, SARIF_FORMAT, additionalArgs, resultsPath, interpretedResultsPath, sourceInfo);
+
+  let output: string;
+  try {
+    output = await fs.readFile(interpretedResultsPath, 'utf8');
+  } catch (err) {
+    throw new Error(`Reading output of interpretation failed: ${err.stderr || err}`);
+  }
+
+  try {
+    return { ...JSON.parse(output) as sarif.Log, t: 'SarifInterpretationData' };
+  } catch (err) {
+    throw new Error(`Parsing output of interpretation failed: ${err.stderr || err}`);
+  }
+}
+
+
+/**
+ * Call cli command to interpret graph results.
+ */
+export async function interpretGraphResults(
+  server: cli.CodeQLCliServer,
+  metadata: QueryMetadata | undefined,
+  resultsPaths: ResultsPaths,
+  sourceInfo?: cli.SourceInfo
+): Promise<GraphInterpretationData> {
+  async function readDotFiles(dir: string): Promise<string[]> {
+    return Promise.all((await fs.readdir(dir))
+      .filter(name => path.extname(name).toLowerCase() === '.dot')
+      .map(file => fs.readFile(path.join(dir, file), 'utf8'))
+    );
+  }
+
+  const { resultsPath, interpretedResultsPath } = resultsPaths;
+  if (await fs.pathExists(interpretedResultsPath)) {
+    const dot = await readDotFiles(interpretedResultsPath);
+    return { dot, t: 'GraphInterpretationData' };
+  }
+  if (metadata === undefined) {
+    throw new Error('Can\'t interpret results without query metadata');
+  }
+  const { kind } = metadata;
+  if (kind === undefined) {
+    throw new Error('Can\'t interpret results without query metadata including kind');
+  }
+  const id = 'graph';
+
+  const additionalArgs = sourceInfo ? ['--dot-location-url-format', 'file://' + sourceInfo.sourceLocationPrefix + '{path}:{start:line}:{start:column}:{end:line}:{end:column}'] : [];
+
+  await server.interpretBqrs({ kind, id }, 'dot', additionalArgs, resultsPath, interpretedResultsPath, sourceInfo);
+
+  try {
+    const dot = await readDotFiles(interpretedResultsPath);
+    return { dot, t: 'GraphInterpretationData' };
+  } catch (err) {
+    throw new Error(`Reading output of interpretation failed: ${err.stderr || err}`);
+  }
 }

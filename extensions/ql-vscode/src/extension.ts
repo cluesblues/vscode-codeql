@@ -32,7 +32,8 @@ import { DatabaseUI } from './databases-ui';
 import {
   TemplateQueryDefinitionProvider,
   TemplateQueryReferenceProvider,
-  TemplatePrintAstProvider
+  TemplatePrintAstProvider,
+  TemplatePrintCfgProvider
 } from './contextual/templateProvider';
 import {
   DEFAULT_DISTRIBUTION_VERSION_RANGE,
@@ -59,6 +60,7 @@ import { QLTestAdapterFactory } from './test-adapter';
 import { TestUIService } from './test-ui';
 import { CompareInterfaceManager } from './compare/compare-interface';
 import { gatherQlFiles } from './pure/files';
+import * as messages from './pure/messages';
 
 /**
  * extension.ts
@@ -432,6 +434,7 @@ async function activateWithInstalledDistribution(
     selectedQuery: Uri | undefined,
     progress: helpers.ProgressCallback,
     token: CancellationToken,
+    templates?: messages.TemplateDefinitions,
   ): Promise<void> {
     if (qs !== undefined) {
       const dbItem = await databaseUI.getDatabaseItem(progress, token);
@@ -445,7 +448,8 @@ async function activateWithInstalledDistribution(
         quickEval,
         selectedQuery,
         progress,
-        token
+        token,
+        templates
       );
       const item = qhm.addQuery(info);
       await showResultsForCompletedQuery(item, WebviewReveal.NotForced);
@@ -637,6 +641,26 @@ async function activateWithInstalledDistribution(
       {
         title: 'Adding database from URL',
       })
+  );
+
+  ctx.subscriptions.push(
+    helpers.commandRunnerWithProgress(
+      'codeQL.viewCfg',
+      async (
+        progress: helpers.ProgressCallback,
+        token: CancellationToken
+      ) => {
+        const res = await new TemplatePrintCfgProvider(cliServer, dbm)
+          .provideCfgUri(window.activeTextEditor?.document);
+        if (res) {
+          await compileAndRunQuery(false, res[0], progress, token, res[1]);
+        }
+      },
+      {
+        title: 'Calculate CFG',
+        cancellable: true
+      }
+    )
   );
 
   logger.log('Starting language server.');
